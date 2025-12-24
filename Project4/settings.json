@@ -1,0 +1,14 @@
+{
+  "showCpu": true,
+  "showCores": true,
+  "showRam": true,
+  "showRamDetail": true,
+  "showGpu": true,
+  "showVram": true,
+  "showDrives": true,
+  "showDiskIo": true,
+  "showBios": true,
+  "showUptime": true,
+  "showBattery": true,
+  "miniMode": false
+}
