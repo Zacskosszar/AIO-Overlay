@@ -1,52 +1,80 @@
 #include "shared.h"
-#include <wbemidl.h>
-#include <comdef.h>
+#include <gl/GL.h>
 
-#pragma comment(lib, "wbemuuid.lib")
-
-// WMI Helper
-std::wstring GetGpuWmi(const std::wstring& prop) {
-    std::wstring result = L"Unknown";
-    HRESULT hres;
-    IWbemLocator* pLoc = NULL;
-    IWbemServices* pSvc = NULL;
-    CoInitializeEx(0, COINIT_MULTITHREADED);
-    CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc);
-    if (!pLoc) return result;
-
-    pLoc->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), NULL, NULL, 0, NULL, 0, 0, &pSvc);
-    if (pSvc) {
-        CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
-        IEnumWbemClassObject* pEnumerator = NULL;
-        pSvc->ExecQuery(bstr_t("WQL"), bstr_t("SELECT Name FROM Win32_VideoController"), WBEM_FLAG_FORWARD_ONLY, NULL, &pEnumerator);
-        if (pEnumerator) {
-            IWbemClassObject* pclsObj = NULL;
-            ULONG uReturn = 0;
-            pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
-            if (uReturn != 0) {
-                VARIANT vtProp;
-                pclsObj->Get(prop.c_str(), 0, &vtProp, 0, 0);
-                if (vtProp.vt == VT_BSTR) result = vtProp.bstrVal;
-                VariantClear(&vtProp);
-                pclsObj->Release();
-            }
-            pEnumerator->Release();
-        }
-        pSvc->Release();
-    }
-    pLoc->Release();
-    return result;
-}
+// Link OpenGL
+#pragma comment(lib, "opengl32.lib")
 
 void InitGpuInfo() {
-    std::wstring name = GetGpuWmi(L"Name");
-    std::lock_guard<std::mutex> lock(g_StatsMutex);
-    g_GpuName = name;
+    WmiQuery wmi;
+    if (!wmi.Init()) return;
+    IEnumWbemClassObject* pEnum = wmi.Exec(L"SELECT Name FROM Win32_VideoController");
+    if (pEnum) {
+        IWbemClassObject* pObj = nullptr; ULONG uRet = 0;
+        pEnum->Next(WBEM_INFINITE, 1, &pObj, &uRet);
+        if (uRet) {
+            VARIANT v; pObj->Get(L"Name", 0, &v, 0, 0);
+            if (v.vt == VT_BSTR) {
+                std::lock_guard<std::mutex> lock(g_StatsMutex);
+                g_GpuName = v.bstrVal;
+            }
+            VariantClear(&v); pObj->Release();
+        }
+        pEnum->Release();
+    }
+}
+
+// OpenGL Stress Worker
+void GpuStressWorker() {
+    // Create invisible window for GL context
+    WNDCLASSW wc = { 0 }; wc.lpfnWndProc = DefWindowProc; wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = L"GLStress";
+    RegisterClassW(&wc);
+    HWND hwnd = CreateWindowW(L"GLStress", L"", WS_POPUP, 0, 0, 100, 100, NULL, NULL, GetModuleHandle(NULL), NULL);
+    HDC hdc = GetDC(hwnd);
+
+    PIXELFORMATDESCRIPTOR pfd = { sizeof(PIXELFORMATDESCRIPTOR), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER, PFD_TYPE_RGBA, 32, 0,0,0,0,0,0, 0,0,0,0,0,0,0, 24, 8, 0, PFD_MAIN_PLANE, 0, 0, 0, 0 };
+    int format = ChoosePixelFormat(hdc, &pfd);
+    SetPixelFormat(hdc, format, &pfd);
+    HGLRC hglrc = wglCreateContext(hdc);
+    wglMakeCurrent(hdc, hglrc);
+
+    // Heavy math in immediate mode for broad compatibility (no shader loader needed for demo)
+    // Draws thousands of transparent overlapping quads to stress ROPs and fillrate
+    while (g_GpuStress && g_AppRunning) {
+        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        glBegin(GL_QUADS);
+        for (int i = 0; i < 4000; i++) {
+            float r = (float)(rand() % 100) / 100.0f;
+            float g = (float)(rand() % 100) / 100.0f;
+            float b = (float)(rand() % 100) / 100.0f;
+            glColor4f(r, g, b, 0.1f);
+
+            float x = (float)(rand() % 200) / 100.0f - 1.0f;
+            float y = (float)(rand() % 200) / 100.0f - 1.0f;
+            glVertex2f(x, y);
+            glVertex2f(x + 0.5f, y);
+            glVertex2f(x + 0.5f, y + 0.5f);
+            glVertex2f(x, y + 0.5f);
+        }
+        glEnd();
+
+        // Force GPU to finish queue
+        glFinish();
+        SwapBuffers(hdc);
+    }
+
+    wglMakeCurrent(NULL, NULL);
+    wglDeleteContext(hglrc);
+    ReleaseDC(hwnd, hdc);
+    DestroyWindow(hwnd);
 }
 
 void StartGpuStress() {
-    // Basic busy loop for GPU thread simulation
-    while (g_GpuStress && g_AppRunning) {
-        Sleep(10);
-    }
+    g_GpuStress = true;
+    std::thread(GpuStressWorker).detach();
 }
