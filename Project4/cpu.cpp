@@ -1,4 +1,4 @@
-#include "shared.h"
+#include "shared.hpp"
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <immintrin.h>

@@ -139,7 +139,8 @@
     <ClCompile Include="system.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="Shared.h" />
+    <ClInclude Include="ChipDefs.hpp" />
+    <ClInclude Include="Shared.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

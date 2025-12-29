@@ -1,4 +1,4 @@
-#include "shared.h"
+#include "shared.hpp"
 #include <winioctl.h>
 
 #pragma pack(push, 1)

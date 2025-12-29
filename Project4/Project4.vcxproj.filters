@@ -38,7 +38,10 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="Shared.h">
+    <ClInclude Include="Shared.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ChipDefs.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

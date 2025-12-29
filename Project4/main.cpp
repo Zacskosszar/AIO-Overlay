@@ -1,4 +1,4 @@
-#include "shared.h"
+#include "shared.hpp"
 #include <gdiplus.h>
 #include <fcntl.h>
 #include <io.h>
@@ -96,7 +96,7 @@ void OpenSettingsWindow(HINSTANCE hInst);
 #define ID_CHK_BATTERY 111
 #define ID_CHK_LOGGING 112
 
-// Re-using WmiQuery from shared.h (implemented in system.cpp)
+// Re-using WmiQuery from shared.hpppppp (implemented in system.cpp)
 // (Detailed RAM info logic remains same as previous turn, simplified here for brevity)
 void GetDetailedRamInfo() {
     WmiQuery wmi;

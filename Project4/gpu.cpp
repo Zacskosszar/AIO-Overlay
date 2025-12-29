@@ -1,4 +1,4 @@
-#include "shared.h"
+#include "shared.hpp"
 #include <gl/GL.h>
 
 // Link OpenGL
