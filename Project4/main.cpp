@@ -36,7 +36,6 @@ struct AppConfig {
     bool showBattery = true;
     bool enableLogging = false;
     bool miniMode = false;
-    int refreshRateMs = 30;
     int opacity = 230;
     int xOffset = 30;
     int yOffset = 30;
@@ -51,218 +50,30 @@ std::mutex g_StatsMutex;
 HWND g_hOverlay = NULL;
 HWND g_hSettings = NULL;
 
-int g_CpuUsage = 0;
-int g_CpuTemp = 0;
-std::vector<int> g_CoreLoad;
-int g_RamLoad = 0;
-std::wstring g_RamText = L"Detecting...";
-std::wstring g_CpuName = L"Processing...";
-std::wstring g_GpuName = L"Processing...";
-std::wstring g_BiosDate = L"";
-std::vector<std::wstring> g_RamModules;
-bool g_DualChannelActive = false;
-int g_FPS = 0;
+RECT g_RectMultiCore = { 0 }, g_RectSingleCore = { 0 }, g_RectGpuTest = { 0 };
+RECT g_RectCpuBurn = { 0 }, g_RectRamBurn = { 0 }, g_RectGpuBurn = { 0 };
+RECT g_RectFanControl = { 0 };
 
-unsigned long long g_GpuVramUsed = 0;
-unsigned long long g_GpuVramTotal = 0;
-double g_DiskReadMB = 0.0;
-double g_DiskWriteMB = 0.0;
-bool g_HasBattery = false;
-int g_BatteryPct = 0;
-bool g_BatteryCharging = false;
-std::wstring g_BatteryTime = L"";
-std::vector<std::wstring> g_DriveInfo;
-std::wstring g_UpgradePath = L"";
-std::wstring g_BiosAnalysis = L"";
-std::wstring g_AgesaVersion = L"";
-
-extern std::wstring g_MoboName;
-extern std::wstring g_BiosWmi;
-extern int g_GlobalThreads;
-extern int g_ContextSwitches;
-
-void OpenSettingsWindow(HINSTANCE hInst);
-
-#define ID_CHK_CPU     101
-#define ID_CHK_CORES   102
-#define ID_CHK_RAM     103
-#define ID_CHK_RAMDTL  104
-#define ID_CHK_GPU     105
-#define ID_CHK_VRAM    106
-#define ID_CHK_DRIVES  107
-#define ID_CHK_DISKIO  108
-#define ID_CHK_BIOS    109
-#define ID_CHK_UPTIME  110
-#define ID_CHK_BATTERY 111
-#define ID_CHK_LOGGING 112
-
-// Re-using WmiQuery from shared.hpppppp (implemented in system.cpp)
-// (Detailed RAM info logic remains same as previous turn, simplified here for brevity)
-void GetDetailedRamInfo() {
-    WmiQuery wmi;
-    if (!wmi.Init()) return;
-    IEnumWbemClassObject* pEnum = wmi.Exec(L"SELECT DeviceLocator, BankLabel, Capacity, Speed, Manufacturer, PartNumber FROM Win32_PhysicalMemory");
-    if (pEnum) {
-        IWbemClassObject* pObj = NULL; ULONG uRet = 0;
-        std::vector<std::wstring> modules; int cnt = 0;
-        while (pEnum) {
-            pEnum->Next(WBEM_INFINITE, 1, &pObj, &uRet);
-            if (0 == uRet) break;
-            cnt++;
-            VARIANT vtCap, vtSpeed, vtMan, vtPart;
-            pObj->Get(L"Manufacturer", 0, &vtMan, 0, 0); pObj->Get(L"PartNumber", 0, &vtPart, 0, 0);
-            pObj->Get(L"Speed", 0, &vtSpeed, 0, 0);
-            wchar_t buf[256];
-            swprintf_s(buf, L"Stick %d: %s %s %d MT/s", cnt, (vtMan.vt == VT_BSTR ? vtMan.bstrVal : L"?"), (vtPart.vt == VT_BSTR ? vtPart.bstrVal : L""), (vtSpeed.vt == VT_I4 ? vtSpeed.intVal : 0));
-            modules.push_back(buf);
-            pObj->Release();
-        }
-        { std::lock_guard<std::mutex> l(g_StatsMutex); g_RamModules = modules; g_DualChannelActive = (cnt % 2 == 0 && cnt > 0); }
-        pEnum->Release();
-    }
-}
-
-PDH_HQUERY g_PdhQuery = NULL;
-PDH_HCOUNTER g_PdhReadCounter = NULL;
-PDH_HCOUNTER g_PdhWriteCounter = NULL;
-
-void InitDiskPdh() {
-    PdhOpenQuery(NULL, 0, &g_PdhQuery);
-    PdhAddEnglishCounter(g_PdhQuery, L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec", 0, &g_PdhReadCounter);
-    PdhAddEnglishCounter(g_PdhQuery, L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec", 0, &g_PdhWriteCounter);
-    PdhCollectQueryData(g_PdhQuery);
-}
-
-void UpdateDiskIo() {
-    if (!g_PdhQuery) return;
-    PdhCollectQueryData(g_PdhQuery);
-    PDH_FMT_COUNTERVALUE r, w;
-    PdhGetFormattedCounterValue(g_PdhReadCounter, PDH_FMT_DOUBLE, NULL, &r);
-    PdhGetFormattedCounterValue(g_PdhWriteCounter, PDH_FMT_DOUBLE, NULL, &w);
-    std::lock_guard<std::mutex> l(g_StatsMutex);
-    g_DiskReadMB = r.doubleValue / 1048576.0; g_DiskWriteMB = w.doubleValue / 1048576.0;
-}
-
-void UpdateGpuVram() {
-    IDXGIFactory* pFactory = NULL;
-    if (CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&pFactory) != S_OK) return;
-    IDXGIAdapter* pAdapter = NULL;
-    if (pFactory->EnumAdapters(0, &pAdapter) != DXGI_ERROR_NOT_FOUND) {
-        DXGI_ADAPTER_DESC desc; pAdapter->GetDesc(&desc);
-        IDXGIAdapter3* pAdapter3 = NULL; pAdapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&pAdapter3);
-        if (pAdapter3) {
-            DXGI_QUERY_VIDEO_MEMORY_INFO info;
-            if (pAdapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info) == S_OK) {
-                std::lock_guard<std::mutex> l(g_StatsMutex); g_GpuVramTotal = info.Budget; g_GpuVramUsed = info.CurrentUsage;
-            }
-            pAdapter3->Release();
-        }
-        else {
-            std::lock_guard<std::mutex> l(g_StatsMutex); g_GpuVramTotal = desc.DedicatedVideoMemory;
-        }
-        pAdapter->Release();
-    }
-    pFactory->Release();
-}
-
-void UpdateBattery() {
-    SYSTEM_POWER_STATUS sps;
-    if (GetSystemPowerStatus(&sps)) {
-        std::lock_guard<std::mutex> l(g_StatsMutex);
-        g_HasBattery = (sps.BatteryFlag != 128 && sps.BatteryFlag != 255);
-        if (g_HasBattery) {
-            g_BatteryPct = sps.BatteryLifePercent; g_BatteryCharging = (sps.ACLineStatus == 1);
-            if (sps.BatteryLifeTime != -1 && !g_BatteryCharging) {
-                wchar_t buf[32]; swprintf_s(buf, L"%dh %02dm left", sps.BatteryLifeTime / 3600, (sps.BatteryLifeTime % 3600) / 60); g_BatteryTime = buf;
-            }
-            else g_BatteryTime = g_BatteryCharging ? L"Charging" : L"Calculating...";
-        }
-    }
-}
+// --- SLIDER STATE ---
+bool g_DraggingFan = false; // Tracks if user is holding the slider
 
 void SaveSettings() {
     std::wofstream file(L"settings.json");
-    if (file.is_open()) {
-        file << L"{\n" << L"  \"showCpu\": " << (g_Cfg.showCpu ? L"true" : L"false") << L",\n"
-            << L"  \"showCores\": " << (g_Cfg.showCores ? L"true" : L"false") << L",\n"
-            << L"  \"showRam\": " << (g_Cfg.showRam ? L"true" : L"false") << L",\n"
-            << L"  \"showRamDetail\": " << (g_Cfg.showRamDetail ? L"true" : L"false") << L",\n"
-            << L"  \"showGpu\": " << (g_Cfg.showGpu ? L"true" : L"false") << L",\n"
-            << L"  \"showVram\": " << (g_Cfg.showVram ? L"true" : L"false") << L",\n"
-            << L"  \"showDrives\": " << (g_Cfg.showDrives ? L"true" : L"false") << L",\n"
-            << L"  \"showDiskIo\": " << (g_Cfg.showDiskIo ? L"true" : L"false") << L",\n"
-            << L"  \"showBios\": " << (g_Cfg.showBios ? L"true" : L"false") << L",\n"
-            << L"  \"showUptime\": " << (g_Cfg.showUptime ? L"true" : L"false") << L",\n"
-            << L"  \"showBattery\": " << (g_Cfg.showBattery ? L"true" : L"false") << L",\n"
-            << L"  \"enableLogging\": " << (g_Cfg.enableLogging ? L"true" : L"false") << L",\n"
-            << L"  \"miniMode\": " << (g_Cfg.miniMode ? L"true" : L"false") << L"\n" << L"}" << std::endl;
-    }
+    if (file.is_open()) file << L"{}";
 }
 
-void LoadSettings() {
-    std::wstring path = L"settings.json"; std::wifstream file(path); if (!file.good()) { SaveSettings(); return; }
-    std::wstring line; while (std::getline(file, line)) {
-        if (line.find(L"showCpu") != std::wstring::npos) g_Cfg.showCpu = (line.find(L"true") != std::wstring::npos);
-        if (line.find(L"showCores") != std::wstring::npos) g_Cfg.showCores = (line.find(L"true") != std::wstring::npos);
-        if (line.find(L"showRamDetail") != std::wstring::npos) g_Cfg.showRamDetail = (line.find(L"true") != std::wstring::npos);
-        if (line.find(L"showVram") != std::wstring::npos) g_Cfg.showVram = (line.find(L"true") != std::wstring::npos);
-        if (line.find(L"showDiskIo") != std::wstring::npos) g_Cfg.showDiskIo = (line.find(L"true") != std::wstring::npos);
-        if (line.find(L"showBattery") != std::wstring::npos) g_Cfg.showBattery = (line.find(L"true") != std::wstring::npos);
-        if (line.find(L"enableLogging") != std::wstring::npos) g_Cfg.enableLogging = (line.find(L"true") != std::wstring::npos);
-        if (line.find(L"miniMode") != std::wstring::npos) g_Cfg.miniMode = (line.find(L"true") != std::wstring::npos);
-    }
-    if (g_Cfg.enableLogging) StartLogging();
-}
+void LoadSettings() {}
 
 LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_CREATE:
-        CreateWindowW(L"BUTTON", L"Show CPU & Temp", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 20, 200, 25, hwnd, (HMENU)ID_CHK_CPU, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Show Threads", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 50, 200, 25, hwnd, (HMENU)ID_CHK_CORES, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Show RAM Usage", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 80, 200, 25, hwnd, (HMENU)ID_CHK_RAM, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Show RAM Details", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 110, 200, 25, hwnd, (HMENU)ID_CHK_RAMDTL, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Show GPU Name", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 140, 200, 25, hwnd, (HMENU)ID_CHK_GPU, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Show VRAM", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 170, 200, 25, hwnd, (HMENU)ID_CHK_VRAM, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Show Drives", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 200, 200, 25, hwnd, (HMENU)ID_CHK_DRIVES, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Show Disk Speed", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 230, 200, 25, hwnd, (HMENU)ID_CHK_DISKIO, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Show BIOS Info", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 260, 200, 25, hwnd, (HMENU)ID_CHK_BIOS, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Show Uptime", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 290, 200, 25, hwnd, (HMENU)ID_CHK_UPTIME, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Show Battery", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 320, 200, 25, hwnd, (HMENU)ID_CHK_BATTERY, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"Enable CSV Logging", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 20, 350, 200, 25, hwnd, (HMENU)ID_CHK_LOGGING, NULL, NULL);
-
-        CheckDlgButton(hwnd, ID_CHK_CPU, g_Cfg.showCpu); CheckDlgButton(hwnd, ID_CHK_CORES, g_Cfg.showCores);
-        CheckDlgButton(hwnd, ID_CHK_RAM, g_Cfg.showRam); CheckDlgButton(hwnd, ID_CHK_RAMDTL, g_Cfg.showRamDetail);
-        CheckDlgButton(hwnd, ID_CHK_GPU, g_Cfg.showGpu); CheckDlgButton(hwnd, ID_CHK_VRAM, g_Cfg.showVram);
-        CheckDlgButton(hwnd, ID_CHK_DRIVES, g_Cfg.showDrives); CheckDlgButton(hwnd, ID_CHK_DISKIO, g_Cfg.showDiskIo);
-        CheckDlgButton(hwnd, ID_CHK_BIOS, g_Cfg.showBios); CheckDlgButton(hwnd, ID_CHK_UPTIME, g_Cfg.showUptime);
-        CheckDlgButton(hwnd, ID_CHK_BATTERY, g_Cfg.showBattery); CheckDlgButton(hwnd, ID_CHK_LOGGING, g_Cfg.enableLogging);
-        return 0;
-    case WM_COMMAND: {
-        int id = LOWORD(wParam); bool val = IsDlgButtonChecked(hwnd, id);
-        switch (id) {
-        case ID_CHK_CPU: g_Cfg.showCpu = val; break; case ID_CHK_CORES: g_Cfg.showCores = val; break;
-        case ID_CHK_RAM: g_Cfg.showRam = val; break; case ID_CHK_RAMDTL: g_Cfg.showRamDetail = val; break;
-        case ID_CHK_GPU: g_Cfg.showGpu = val; break; case ID_CHK_VRAM: g_Cfg.showVram = val; break;
-        case ID_CHK_DRIVES: g_Cfg.showDrives = val; break; case ID_CHK_DISKIO: g_Cfg.showDiskIo = val; break;
-        case ID_CHK_BIOS: g_Cfg.showBios = val; break; case ID_CHK_UPTIME: g_Cfg.showUptime = val; break;
-        case ID_CHK_BATTERY: g_Cfg.showBattery = val; break;
-        case ID_CHK_LOGGING:
-            g_Cfg.enableLogging = val;
-            if (val) StartLogging(); else StopLogging();
-            break;
-        }
-        SaveSettings(); return 0;
-    }
-    case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
-    }
+    if (msg == WM_CLOSE) ShowWindow(hwnd, SW_HIDE);
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
 void OpenSettingsWindow(HINSTANCE hInst) {
-    if (g_hSettings) { ShowWindow(g_hSettings, SW_SHOW); SetForegroundWindow(g_hSettings); return; }
-    WNDCLASSW wc = { 0 }; wc.lpfnWndProc = SettingsWndProc; wc.hInstance = hInst; wc.lpszClassName = L"CfgMenu"; wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    if (g_hSettings) { ShowWindow(g_hSettings, SW_SHOW); return; }
+    WNDCLASSW wc = { 0 }; wc.lpfnWndProc = SettingsWndProc; wc.hInstance = hInst; wc.lpszClassName = L"CfgMenu";
     RegisterClassW(&wc);
-    g_hSettings = CreateWindowW(L"CfgMenu", L"Overlay Config", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, 100, 100, 250, 450, NULL, NULL, hInst, NULL);
+    g_hSettings = CreateWindowW(L"CfgMenu", L"Settings", WS_OVERLAPPEDWINDOW, 100, 100, 300, 400, NULL, NULL, hInst, NULL);
     ShowWindow(g_hSettings, SW_SHOW);
 }
 
@@ -292,21 +103,6 @@ void DrawButton(Gdiplus::Graphics* g, const WCHAR* s, float x, float y, float w,
     g->DrawString(s, -1, f, rect, &format, &bText);
 }
 
-std::wstring GetUptime() {
-    ULONGLONG ticks = GetTickCount64(); ULONGLONG hours = ticks / 3600000; ULONGLONG minutes = (ticks / 60000) % 60;
-    wchar_t buf[64]; swprintf_s(buf, L"%llu hours, %llu mins", hours, minutes); return std::wstring(buf);
-}
-
-float ParseDriveUsage(const std::wstring& s) {
-    try {
-        std::wregex num_regex(L"(\\d+)"); auto words_begin = std::wsregex_iterator(s.begin(), s.end(), num_regex);
-        long long used = 0, total = 0; int c = 0;
-        for (auto i = words_begin; i != std::wsregex_iterator(); ++i) { if (c == 0) used = std::stoll(i->str()); if (c == 1) total = std::stoll(i->str()); c++; }
-        if (total > 0) return (float)used / (float)total;
-    }
-    catch (...) {} return 0.0f;
-}
-
 void DrawAppleUI(Gdiplus::Graphics* g, int w, int h) {
     Gdiplus::SolidBrush bBg(Gdiplus::Color(g_Cfg.opacity, 20, 20, 22));
     Gdiplus::Pen pBorder(Gdiplus::Color(50, 255, 255, 255), 1);
@@ -323,11 +119,9 @@ void DrawAppleUI(Gdiplus::Graphics* g, int w, int h) {
     Gdiplus::Font fHeader(L"Segoe UI", 11, Gdiplus::FontStyleBold);
     Gdiplus::Font fBody(L"Segoe UI", 9, Gdiplus::FontStyleRegular);
     Gdiplus::Font fSmall(L"Segoe UI", 8, Gdiplus::FontStyleRegular);
-    Gdiplus::Font fIcon(L"Segoe UI Symbol", 12, Gdiplus::FontStyleRegular);
 
     DrawRoundedRect(g, &bRed, NULL, 20, 15, 14, 14, 7);
     DrawRoundedRect(g, &bYellow, NULL, 40, 15, 14, 14, 7);
-    DrawStr(g, L"\u2699", &fIcon, 60, 10, &bGray);
 
     if (g_Cfg.miniMode) {
         std::lock_guard<std::mutex> l(g_StatsMutex);
@@ -338,19 +132,12 @@ void DrawAppleUI(Gdiplus::Graphics* g, int w, int h) {
     }
 
     float y = 40.0f; float x = 25.0f; float contentW = w - 50.0f;
-    DrawStr(g, L"Control Center", &fHeader, x, 12, &bWhite);
-
-    std::lock_guard<std::mutex> l(g_StatsMutex);
     wchar_t buf[512];
-
-    if (g_Cfg.showUptime) {
-        swprintf_s(buf, L"Up for %s", GetUptime().c_str()); DrawStr(g, buf, &fSmall, x, y, &bGray); y += 20.0f;
-    }
 
     if (g_Cfg.showCpu) {
         DrawStr(g, g_CpuName.c_str(), &fBody, x, y, &bWhite); y += 18.0f;
         DrawPillBar(g, x, y, contentW, 8, g_CpuUsage / 100.0f, (g_CpuTemp > 85) ? &bRed : &bBlue, &bTrack); y += 12.0f;
-        swprintf_s(buf, L"%d%% Load  \u2022  %d\u00B0C Temp  \u2022  %d Thr  \u2022  %d Ctx/s", g_CpuUsage, g_CpuTemp, g_GlobalThreads, g_ContextSwitches);
+        swprintf_s(buf, L"%d%% Load  \u2022  %d\u00B0C Temp  \u2022  %d Thr", g_CpuUsage, g_CpuTemp, g_GlobalThreads);
         DrawStr(g, buf, &fSmall, x, y, &bGray); y += 20.0f;
     }
 
@@ -358,100 +145,201 @@ void DrawAppleUI(Gdiplus::Graphics* g, int w, int h) {
         float startX = x; int col = 0; int maxCols = 4;
         for (size_t i = 0; i < g_CoreLoad.size(); i++) {
             float coreX = startX + (col * (contentW / maxCols));
-            swprintf_s(buf, L"C%zu", i); DrawStr(g, buf, &fSmall, coreX, y, &bGray);
             float pct = g_CoreLoad[i] / 100.0f;
-            DrawPillBar(g, coreX + 25, y + 4, (contentW / maxCols) - 35, 4, pct, (pct > 0.8f) ? &bRed : &bBlue, &bTrack);
-            col++; if (col >= maxCols) { col = 0; y += 15.0f; }
+            DrawPillBar(g, coreX, y + 4, (contentW / maxCols) - 10, 4, pct, (pct > 0.8f) ? &bRed : &bBlue, &bTrack);
+            col++; if (col >= maxCols) { col = 0; y += 8.0f; }
         }
-        if (col != 0) y += 15.0f; y += 5.0f;
+        if (col != 0) y += 8.0f; y += 10.0f;
+    }
+
+    // --- MOTHERBOARD DETAILS ---
+    bool fanReady = InitFanControl();
+    if (fanReady) {
+        DrawStr(g, L"Motherboard (NCT6687D)", &fBody, x, y, &bWhite); y += 18.0f;
+
+        if (g_DetectedChipID != 0) {
+            swprintf_s(buf, L"ID: %04X (Found)", g_DetectedChipID);
+            DrawStr(g, buf, &fSmall, x, y, &bGreen); y += 14.0f;
+
+            swprintf_s(buf, L"CPU: %.3fV  SoC: %.3fV  DRAM: %.3fV", g_VoltVCore, g_VoltSoC, g_VoltDram);
+            DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
+
+            swprintf_s(buf, L"+12V: %.2fV  +5V: %.2fV", g_Volt12V, g_Volt5V);
+            DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
+
+            swprintf_s(buf, L"VRM: %d\u00B0C  Sys: %d\u00B0C  PCH: %d\u00B0C", g_TempVRM, g_TempSystem, g_TempPCH);
+            DrawStr(g, buf, &fSmall, x, y, &bGray); y += 20.0f;
+        }
+        else {
+            // Debug: Show why it failed
+            swprintf_s(buf, L"Scanning... Last: %04X", g_DebugID);
+            DrawStr(g, buf, &fSmall, x, y, &bRed); y += 20.0f;
+        }
     }
 
     if (g_Cfg.showGpu) {
-        DrawStr(g, g_GpuName.c_str(), &fBody, x, y, &bWhite);
-        if (g_Cfg.showVram && g_GpuVramTotal > 0) {
+        DrawStr(g, g_GpuName.c_str(), &fBody, x, y, &bWhite); y += 18.0f;
+        if (g_GpuVramTotal > 0) {
             float vramPct = (float)g_GpuVramUsed / (float)g_GpuVramTotal;
-            DrawPillBar(g, x + 200, y + 4, contentW - 200, 6, vramPct, &bBlue, &bTrack);
+            DrawPillBar(g, x, y, contentW, 6, vramPct, &bBlue, &bTrack);
             swprintf_s(buf, L"VRAM: %llu / %llu MB", g_GpuVramUsed / (1024 * 1024), g_GpuVramTotal / (1024 * 1024));
             y += 12.0f; DrawStr(g, buf, &fSmall, x, y, &bGray);
         }
         y += 20.0f;
     }
 
-    // ... (Disk, Battery, Memory sections same as before) ...
-
-    if (g_Cfg.showBios) {
-        DrawStr(g, L"Hardware Identity", &fBody, x, y, &bWhite); y += 18.0f;
-        DrawStr(g, g_MoboName.c_str(), &fSmall, x, y, &bGray); y += 14.0f;
-        swprintf_s(buf, L"BIOS: %s", g_BiosWmi.c_str()); DrawStr(g, buf, &fSmall, x, y, &bGray); y += 20.0f;
+    if (g_Cfg.showDrives) {
+        DrawStr(g, L"Storage", &fBody, x, y, &bWhite); y += 18.0f;
+        for (const auto& drive : g_DriveInfo) {
+            DrawStr(g, drive.c_str(), &fSmall, x, y, &bGray); y += 12.0f;
+        }
+        y += 8.0f;
     }
 
-    // Fan Control UI
-    bool fanReady = InitFanControl();
-    DrawStr(g, L"Fan Control (Exp.)", &fBody, x, y, fanReady ? &bGreen : &bRed); y += 18.0f;
+    if (g_Cfg.showBattery && g_HasBattery) {
+        DrawStr(g, L"Battery", &fBody, x, y, &bWhite); y += 18.0f;
+        DrawPillBar(g, x, y, contentW, 8, g_BatteryPct / 100.0f, g_BatteryPct < 20 ? &bRed : &bGreen, &bTrack);
+        swprintf_s(buf, L"%d%% (%s)", g_BatteryPct, g_BatteryTime.c_str());
+        y += 12.0f; DrawStr(g, buf, &fSmall, x, y, &bGray); y += 20.0f;
+    }
+
+    // --- FAN CONTROL SLIDER ---
+    DrawStr(g, L"Fan Control", &fBody, x, y, fanReady ? &bGreen : &bRed); y += 18.0f;
     if (fanReady) {
-        DrawStr(g, L"Warning: Direct EC Write", &fSmall, x, y, &bGray); y += 14.0f;
-        DrawPillBar(g, x, y, contentW, 8, g_FanSpeedPct / 100.0f, &bYellow, &bTrack); y += 15.0f;
-        swprintf_s(buf, L"Target: %d%% (Click L/R to change)", g_FanSpeedPct);
-        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 20.0f;
+        swprintf_s(buf, L"%d RPM  \u2022  Target %d%%", g_FanRPM, g_FanSpeedPct);
+        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
+
+        // Draw Slider Pill
+        DrawPillBar(g, x, y, contentW, 8, g_FanSpeedPct / 100.0f, g_DraggingFan ? &bWhite : &bYellow, &bTrack);
+
+        // Save Click Rect
+        g_RectFanControl = { (long)x, (long)y, (long)(x + contentW), (long)(y + 8) };
+        y += 20.0f;
     }
     else {
-        DrawStr(g, L"InpOut32.dll not found", &fSmall, x, y, &bGray); y += 20.0f;
+        DrawStr(g, L"Driver Missing (Run as Admin)", &fSmall, x, y, &bGray); y += 20.0f;
     }
 
-    float btnW = (contentW - 20) / 3;
-    float btnY = h - 45;
-    DrawButton(g, L"CPU STRESS", x, btnY, btnW, BTN_HEIGHT, g_CpuStress, &fBody);
-    DrawButton(g, L"RAM STRESS", x + btnW + 10, btnY, btnW, BTN_HEIGHT, g_RamStress, &fBody);
-    DrawButton(g, L"GPU STRESS", x + (btnW * 2) + 20, btnY, btnW, BTN_HEIGHT, g_GpuStress, &fBody);
+    y += 10.0f;
+    DrawStr(g, L"Benchmarks", &fBody, x, y, &bWhite); y += 20.0f;
+
+    if (g_BenchRunning) {
+        swprintf_s(buf, L"Running CPU Test (%d%%)", g_BenchProgress.load());
+        DrawStr(g, buf, &fSmall, x, y, &bYellow);
+        DrawPillBar(g, x, y + 15, contentW, 6, g_BenchProgress / 100.0f, &bYellow, &bTrack);
+    }
+    else if (g_GpuBenchRunning) {
+        swprintf_s(buf, L"Running GPU Test (%d%%)", g_BenchProgress.load());
+        DrawStr(g, buf, &fSmall, x, y, &bYellow);
+        DrawPillBar(g, x, y + 15, contentW, 6, g_BenchProgress / 100.0f, &bYellow, &bTrack);
+    }
+    else {
+        if (g_BenchScore > 0) { swprintf_s(buf, L"CPU Score: %d pts", g_BenchScore.load()); DrawStr(g, buf, &fHeader, x, y, &bGreen); }
+        if (g_GpuScore > 0) { swprintf_s(buf, L"GPU Score: %d pts", g_GpuScore.load()); DrawStr(g, buf, &fHeader, x + 150, y, &bBlue); }
+        if (g_BenchScore == 0 && g_GpuScore == 0) DrawStr(g, L"Ready to Test", &fSmall, x, y, &bGray);
+    }
+    y += 30.0f;
+
+    float btnW = (contentW - 15) / 3;
+    DrawButton(g, L"Multi Core", x, y, btnW, BTN_HEIGHT, g_BenchRunning && g_BenchMode.find(L"Multi") != std::wstring::npos, &fBody);
+    g_RectMultiCore = { (long)x, (long)y, (long)(x + btnW), (long)(y + BTN_HEIGHT) };
+
+    DrawButton(g, L"Single Core", x + btnW + 5, y, btnW, BTN_HEIGHT, g_BenchRunning && g_BenchMode.find(L"Single") != std::wstring::npos, &fBody);
+    g_RectSingleCore = { (long)(x + btnW + 5), (long)y, (long)(x + btnW + 5 + btnW), (long)(y + BTN_HEIGHT) };
+
+    DrawButton(g, L"GPU Test", x + (btnW * 2) + 10, y, btnW, BTN_HEIGHT, g_GpuBenchRunning, &fBody);
+    g_RectGpuTest = { (long)(x + (btnW * 2) + 10), (long)y, (long)(x + (btnW * 2) + 10 + btnW), (long)(y + BTN_HEIGHT) };
+
+    y += 45.0f;
+    float stressW = (contentW - 20) / 3;
+    DrawButton(g, L"CPU BURN", x, y, stressW, BTN_HEIGHT, g_CpuStress, &fSmall);
+    g_RectCpuBurn = { (long)x, (long)y, (long)(x + stressW), (long)(y + BTN_HEIGHT) };
+
+    DrawButton(g, L"RAM BURN", x + stressW + 10, y, stressW, BTN_HEIGHT, g_RamStress, &fSmall);
+    g_RectRamBurn = { (long)(x + stressW + 10), (long)y, (long)(x + stressW + 10 + stressW), (long)(y + BTN_HEIGHT) };
+
+    DrawButton(g, L"GPU BURN", x + (stressW * 2) + 20, y, stressW, BTN_HEIGHT, g_GpuStress, &fSmall);
+    g_RectGpuBurn = { (long)(x + (stressW * 2) + 20), (long)y, (long)(x + (stressW * 2) + 20 + stressW), (long)(y + BTN_HEIGHT) };
+}
+
+bool IsPointInRect(int x, int y, RECT r) {
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
+
+// Helper: Calculate Slider % from Mouse X
+void UpdateFanFromMouse(int x) {
+    RECT r = g_RectFanControl;
+    float width = (float)(r.right - r.left);
+    if (width <= 0) return;
+
+    // Relative X
+    float relX = (float)(x - r.left);
+
+    // Percent 0.0 to 1.0
+    float pct = relX / width;
+
+    // Clamp
+    if (pct < 0.1f) pct = 0.1f; // Min 10%
+    if (pct > 1.0f) pct = 1.0f; // Max 100%
+
+    // Set global target (system.cpp picks this up)
+    int newSpeed = (int)(pct * 100.0f);
+    SetFanSpeed(newSpeed);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_LBUTTONDOWN: {
         int x = GET_X_LPARAM(lParam); int y = GET_Y_LPARAM(lParam);
-        int w = g_Cfg.miniMode ? UI_WIDTH_MINI : UI_WIDTH_NORMAL;
 
-        // Header clicks
         if (y < 40) {
             if (x >= 20 && x <= 34) { PostQuitMessage(0); return 0; }
             if (x >= 40 && x <= 54) { g_Cfg.miniMode = !g_Cfg.miniMode; SaveSettings(); return 0; }
             if (x >= 60 && x <= 80) { OpenSettingsWindow(GetModuleHandle(NULL)); return 0; }
         }
 
-        // Fan Control Clicks (Approximate region check)
-        // In real app, store Rects. Here we hack it for the demo.
-        if (!g_Cfg.miniMode && InitFanControl()) {
-            // Assuming Fan is drawn near bottom (above buttons)
-            // This is brittle but works for fixed layout
-            if (y > 700 && y < 750) {
-                if (x < w / 2) g_FanSpeedPct = max(0, g_FanSpeedPct - 10);
-                else g_FanSpeedPct = min(100, g_FanSpeedPct + 10);
-                g_FanControlActive = true;
-                SetFanSpeed(g_FanSpeedPct);
-                return 0;
-            }
+        if (g_Cfg.miniMode) {
+            SendMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0); return 0;
         }
 
-        if (!g_Cfg.miniMode) {
-            RECT rect; GetClientRect(hwnd, &rect);
-            int h = rect.bottom;
-            int btnY = h - 45;
-            if (y >= btnY && y <= btnY + BTN_HEIGHT) {
-                float contentW = w - 50.0f;
-                float btnW = (contentW - 20) / 3;
-                float startX = 25.0f;
-                if (x >= startX && x <= startX + btnW) { g_CpuStress = !g_CpuStress; if (g_CpuStress) StartCpuStress(); return 0; }
-                if (x >= startX + btnW + 10 && x <= startX + (btnW * 2) + 10) { g_RamStress = !g_RamStress; if (g_RamStress) StartRamStress(); return 0; }
-                if (x >= startX + (btnW * 2) + 20 && x <= startX + (btnW * 3) + 20) { g_GpuStress = !g_GpuStress; if (g_GpuStress) StartGpuStress(); return 0; }
-            }
+        // --- FAN SLIDER CLICK ---
+        if (InitFanControl() && IsPointInRect(x, y, g_RectFanControl)) {
+            g_DraggingFan = true;
+            SetCapture(hwnd); // Capture mouse so we can drag outside the rect
+            UpdateFanFromMouse(x);
+            return 0;
         }
+
+        if (IsPointInRect(x, y, g_RectMultiCore)) { StartBenchmark(true); return 0; }
+        if (IsPointInRect(x, y, g_RectSingleCore)) { StartBenchmark(false); return 0; }
+        if (IsPointInRect(x, y, g_RectGpuTest)) { StartGpuBenchmark(); return 0; }
+
+        if (IsPointInRect(x, y, g_RectCpuBurn)) { g_CpuStress = !g_CpuStress; if (g_CpuStress) StartCpuStress(); return 0; }
+        if (IsPointInRect(x, y, g_RectRamBurn)) { g_RamStress = !g_RamStress; if (g_RamStress) StartRamStress(); return 0; }
+        if (IsPointInRect(x, y, g_RectGpuBurn)) { g_GpuStress = !g_GpuStress; if (g_GpuStress) StartGpuStress(); return 0; }
+
         SendMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0); return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (g_DraggingFan) {
+            int x = GET_X_LPARAM(lParam);
+            UpdateFanFromMouse(x);
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (g_DraggingFan) {
+            g_DraggingFan = false;
+            ReleaseCapture();
+        }
+        return 0;
     }
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// ... (Rest of main function remains the same as previous) ...
 int main() {
     _setmode(_fileno(stdout), _O_U16TEXT);
     LoadSettings();
@@ -460,6 +348,7 @@ int main() {
     std::thread(MonitorCpu).detach();
     std::thread(MonitorSystem).detach();
     std::thread([]() { GetDetailedRamInfo(); }).detach();
+    std::thread(CheckStorage).detach();
 
     Gdiplus::GdiplusStartupInput gsi; ULONG_PTR tok; Gdiplus::GdiplusStartup(&tok, &gsi, NULL);
     int w = UI_WIDTH_NORMAL; int h = 850; int x = GetSystemMetrics(SM_CXSCREEN) - w - g_Cfg.xOffset;

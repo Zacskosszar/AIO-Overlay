@@ -1,22 +1,24 @@
-#include "shared.h"
+#include "shared.hpp"
+
+// --- DEFINITIONS ---
+int g_RamLoad = 0;
+std::wstring g_RamText = L"RAM";
+
+void GetDetailedRamInfo() {
+    WmiQuery wmi; wmi.Init();
+    IEnumWbemClassObject* pEnum = wmi.Exec(L"SELECT Capacity, Speed FROM Win32_PhysicalMemory");
+    if (pEnum) pEnum->Release();
+}
 
 void StartRamStress() {
     g_RamStress = true;
-    std::thread([] {
-        while (g_RamStress) {
-            std::vector<char*> p;
-            while (g_RamStress && p.size() < 200) {
-                try {
-                    char* b = new char[100 * 1024 * 1024];
-                    memset(b, 0, 100 * 1024 * 1024);
-                    p.push_back(b);
-                    Sleep(50);
-                }
-                catch (...) { break; }
-            }
-            Sleep(1000);
-            for (auto ptr : p) delete[] ptr;
-            p.clear();
+    std::thread([]() {
+        std::vector<int*> ptrs;
+        while (g_RamStress && g_AppRunning) {
+            try { ptrs.push_back(new int[1000000]); std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+            catch (...) { break; }
         }
+        for (auto p : ptrs) delete[] p;
+        g_RamStress = false;
         }).detach();
 }
